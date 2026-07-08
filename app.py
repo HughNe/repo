@@ -43,20 +43,54 @@ def estimate_recession_index(df):
     return "Steady/Rising"
 
 # --- RAINFALL FETCHING ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_rainfall_data(dates):
     lat, lon = 52.0505, -4.3444 
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=precipitation&timezone=GMT&past_days=31&forecast_days=1"
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        hourly = r.json().get('hourly', {})
-        if not hourly: return pd.DataFrame()
-        temp_df = pd.DataFrame({"timestamp": pd.to_datetime(hourly.get('time')), "rainfall": hourly.get('precipitation', [])})
-        temp_df['timestamp'] = temp_df['timestamp'].dt.tz_localize(None)
-        mask = (temp_df['timestamp'].dt.date >= dates[0]) & (temp_df['timestamp'].dt.date <= dates[1])
-        return temp_df.loc[mask].copy()
-    except: return pd.DataFrame()
+    
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            
+            hourly = r.json().get('hourly', {})
+            if not hourly: 
+                st.warning("Rainfall API connected, but returned no data.")
+                return pd.DataFrame()
+                
+            temp_df = pd.DataFrame({
+                "timestamp": pd.to_datetime(hourly.get('time')), 
+                "rainfall": hourly.get('precipitation', [])
+            })
+            temp_df['timestamp'] = temp_df['timestamp'].dt.tz_localize(None)
+            
+            mask = (temp_df['timestamp'].dt.date >= dates[0]) & (temp_df['timestamp'].dt.date <= dates[1])
+            final_df = temp_df.loc[mask].copy()
+            
+            if final_df.empty:
+                st.info("Rainfall data fetched, but none falls within your selected Date Range.")
+                
+            return final_df
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                st.error("⚠️ Rainfall API Rate Limit Reached: Please try again in 15 minutes.")
+            else:
+                st.error(f"⚠️ Rainfall API Error: HTTP {e.response.status_code}")
+            return pd.DataFrame()
+            
+        except requests.exceptions.ReadTimeout:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            else:
+                st.error("⚠️ Rainfall API Error: The Open-Meteo server timed out.")
+                return pd.DataFrame()
+                
+        except Exception as e: 
+            st.error(f"⚠️ Rainfall API Error: {e}")
+            return pd.DataFrame()
 
 # --- SOLAR CALCULATION ---
 def get_solar_events(start_date, end_date):
@@ -90,8 +124,6 @@ show_diurnal_adj = st.sidebar.checkbox("Show Diurnal Adjusted Depth (Stable)", v
 show_solar = st.sidebar.checkbox("Show Sunrise/Sunset", value=True)
 window_size = st.sidebar.slider("Trend Smoothing", 1, 100, 20)
 
-refresh_rate = st.sidebar.slider("Auto-Refresh (secs)", 60, 180, 60)
-
 if st.sidebar.button("🔄 Force Refresh Data"):
     st.cache_data.clear()
     st.rerun()
@@ -107,7 +139,7 @@ def fetch_paginated_data(query_builder):
         offset += page_size
     return pd.DataFrame(all_rows)
 
-@st.cache_data(ttl=refresh_rate)
+@st.cache_data
 def fetch_filtered_data(dates):
     if not isinstance(dates, (list, tuple)) or len(dates) != 2: return pd.DataFrame()
     start_dt, end_dt = datetime.combine(dates[0], datetime.min.time()).isoformat(), datetime.combine(dates[1], datetime.max.time()).isoformat()
@@ -153,8 +185,23 @@ def fetch_filtered_data(dates):
 st.title("🌊 Nant Cledlyn Water Level Analysis")
 st.subheader("by Hugh Neve")
 
+# --- INTRODUCTION SECTION ---
+st.markdown("""
+Welcome to the Nant Cledlyn Water Level Analysis dashboard. 
+
+This data shows the approximate depth of the Nant Cledyn at Drefach, where it runs through our land. Measurements are taken approximately every twenty minutes using an ultrasonic distance sensor and produce the average of ten individual measurements. The averaged value is then passed via a mesh radio network to a receiver that filters out any unrealistic spikes before sending it to this page. This is not a permanent installation and the sensor is mounted to a sturdy branch overhanging the water. This gives rise to diurnal variations as the turgidity of the tree's cells is affected by daytime transpiration and nocturnal 'refilling'. Rainfall data allows the hydrological characteristics to be estimated.  Select 'Force Refresh Data' to get the latest data.
+The step change at the end of May 2026 is due to a repositioning of the sensor to avoid disturbing the nest of a duck. The software was not updated with a new offset - silly me.
+""")
+st.markdown("---")
+# -----------------------------
+
 df = fetch_filtered_data(date_range)
-rain_df = fetch_rainfall_data(date_range) if show_rain else pd.DataFrame()
+
+if show_rain:
+    with st.spinner("☁️ Fetching live rainfall data from Open-Meteo..."):
+        rain_df = fetch_rainfall_data(date_range)
+else:
+    rain_df = pd.DataFrame()
 
 if not df.empty:
     latest_time = df.iloc[-1]["timestamp"].strftime("%d %b %Y, %H:%M")
@@ -188,7 +235,6 @@ if not df.empty:
         fig1.add_trace(go.Scatter(x=sunrises, y=[y_max_val]*len(sunrises), mode='markers', name='Sunrise', marker=dict(symbol='triangle-up', size=8, color='#FFD700'), hoverinfo='skip'))
         fig1.add_trace(go.Scatter(x=sunsets, y=[y_max_val]*len(sunsets), mode='markers', name='Sunset', marker=dict(symbol='triangle-down', size=8, color='#FF4500'), hoverinfo='skip'))
 
-    # FIX: Removed the invalid `id="x1"` parameter. Primary X-axis is referenced automatically as "x".
     fig1.update_layout(
         template="plotly_dark", height=400, margin=dict(t=20, b=20),
         xaxis=dict(title="Time", showticklabels=True), 
@@ -206,7 +252,6 @@ if not df.empty:
     fig_roc.add_trace(go.Scatter(x=df["timestamp"], y=df["roc"], name='RoC (cm/min)', line=dict(color='#FF4B4B', width=1.5), fill='tozeroy', fillcolor='rgba(255, 75, 75, 0.1)'))
     fig_roc.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.3)
     
-    # FIX: Configured `matches="x"` to sync directly to the primary layout of Chart 1
     fig_roc.update_layout(
         template="plotly_dark", height=300, margin=dict(t=10, b=10), 
         xaxis=dict(title="Time", matches="x"), 
@@ -228,6 +273,26 @@ if not df.empty:
     fig2.add_trace(go.Scatter(x=agg_trend["time_of_day"], y=agg_trend["daily_pct"], name='Avg Trend', line=dict(color='red', width=4)))
     fig2.update_layout(template="plotly_dark", height=450, xaxis=dict(title="Hour of Day (0-24)", range=[0, 24]), yaxis=dict(title="Daily Range (%)"))
     st.plotly_chart(fig2, use_container_width=True)
+
+    # Plot 4 (NEW) - Depth Histogram
+    st.markdown("### 📊 Depth Distribution")
+    fig_hist = go.Figure(data=[
+        go.Histogram(
+            x=df["reading_value"], 
+            nbinsx=30, 
+            marker_color='#33C3F0', 
+            opacity=0.75
+        )
+    ])
+    fig_hist.update_layout(
+        template="plotly_dark", 
+        height=350, 
+        margin=dict(t=20, b=20),
+        xaxis_title="River Depth (cm)", 
+        yaxis_title="Frequency",
+        bargap=0.05
+    )
+    st.plotly_chart(fig_hist, use_container_width=True)
 
     # Intelligence Section
     st.markdown("---")
@@ -254,10 +319,6 @@ if not df.empty:
         st.latex(r"h_{\text{adjusted}}(t) = h_{\text{actual}}(t) - \overline{\Delta h}(\text{minute of day})")
 
     st.download_button("📥 Download View CSV", data=df.to_csv(index=False).encode('utf-8'), file_name="nant_cledlyn.csv", mime="text/csv")
-    time.sleep(refresh_rate)
-    st.rerun()
 
 else:
     st.info("No river data found.")
-    time.sleep(refresh_rate)
-    st.rerun()
